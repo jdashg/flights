@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html>
+   <head>
+      <meta charset='utf-8'>
+      <title>Flight-AR</title>
+   </head>
+   <body>
+      <style>
+body {
+   margin: 0em;
+   width: 100vw;
+   height: 100vh;
+
+   background-color: LightGray;
+
+   font-family: sans-serif;
+   font-size: 1.5rem;
+}
+
+#g_location_sprite {
+   /* icon-ic_navigation_white_24dp */
+   background-image: url(sprite-alert-white.png);
+   background-position: -224px -0px;
+   width: 32px;
+   height: 32px;
+}
+
+#g_log {
+   position: fixed;
+   margin: 0em;
+   padding-left: 0.5em;
+   z-index: 1;
+
+   font-weight: bold;
+   color: black;
+   text-shadow: 0 0 2px white,
+      0 0 2px white,
+      0 0 2px white,
+      0 0 2px white;
+}
+
+#g_top_down {
+   position: absolute;
+   z-index: -1;
+   margin-top: -50vmin;
+   top: 50%;
+   width: 100vmin;
+   height: 100vmin;
+   background-color: DarkGray;
+}
+      </style>
+
+      <pre id='g_log'></pre>
+      <div id='g_top_down'></div>
+      <img id='g_plane_sprite' src='200px-Plane_icon_nose_up.svg.png' style='display: none;'/>
+      <img id='g_location_sprite' src='ic_gps_fixed_white_48dp.png' style='display: none;'/>
+      <script>
+'use strict';
+
+const MIN_LOG_LINES = 3;
+const MAX_LOG_LINES = 30;
+
+g_log.lines = [];
+g_log.max_lines = MIN_LOG_LINES;
+
+function log() {
+   if (arguments.length) {
+      console.log.apply(null, arguments);
+      let args = [];
+      for (let x of arguments) {
+         if (x === undefined) {
+            x = 'undefined';
+         } else if (x === null) {
+            x = 'null';
+         } else if (typeof(x) !== 'string') {
+            x = x.toString();
+         }
+         args.push(x);
+      }
+      args = args.join(' ');
+      g_log.lines = g_log.lines.concat(args.split('\n'))
+   }
+
+   while (g_log.lines.length > MAX_LOG_LINES) {
+      g_log.lines.shift();
+   }
+   let lines = g_log.lines;
+   if (lines.length > g_log.max_lines) {
+      lines = lines.slice(lines.length - g_log.max_lines);
+   }
+   g_log.textContent = lines.join('\n');
+}
+
+function toggle_log_size(e) {
+   e.preventDefault(); // If touch, prevent mouse events.
+
+   if (g_log.max_lines == MAX_LOG_LINES) {
+      g_log.max_lines = MIN_LOG_LINES;
+   } else {
+      g_log.max_lines = MAX_LOG_LINES;
+   }
+   log(); // Redraw.
+}
+g_log.addEventListener('mousedown', toggle_log_size, true);
+g_log.addEventListener('touchstart', toggle_log_size, true);
+
+log('Initializing...');
+
+// -
+
+let g_orientation = null;
+let g_position = null;
+
+function on_orientation(e) {
+   g_orientation = e;
+   //log(e.alpha.toPrecision(4), e.beta.toPrecision(4), e.gamma.toPrecision(4), e.absolute);
+}
+function on_position(e) {
+   g_position = e;
+   //log(e.coords.latitude, e.coords.longitude);
+}
+
+// -
+
+if ('onabsolutedeviceorientation' in window) {
+   window.addEventListener("absolutedeviceorientation", on_orientation);
+} else {
+   log('No absolutedeviceorientation, falling back to deviceorientation.');
+   window.addEventListener("deviceorientation", on_orientation);
+}
+
+// -
+
+function geo_error(e) {
+   log(`Warning: ${e.message}`);
+}
+
+const geo_options = {
+  enableHighAccuracy: true,
+  maximumAge        : 30000,
+  timeout           : 27000,
+};
+navigator.geolocation.watchPosition(on_position, geo_error, geo_options);
+
+// -
+
+const KM_PER_LAT = 111;
+const BOX_SIZE_KM = 60;
+const BOX_SIZE_DEG = BOX_SIZE_KM / KM_PER_LAT;
+
+function encode_url_dict(obj) {
+   let kvs = [];
+   for (const k in obj) {
+      const v = obj[k];
+      const kv = encodeURIComponent(k) + '=' + encodeURIComponent(v)
+      kvs.push(kv);
+   }
+   return kvs.join('&');
+}
+
+function remap_keys(obj, mapping) {
+   const ret = {};
+   for (const i in mapping) {
+      const k = mapping[i];
+      ret[k] = obj[i];
+   }
+   return ret;
+}
+
+const REMAP_OPENSKY_STATES = [
+   'icao', // icao24
+   'callsign',
+   'origin_country',
+   'time_position',
+   'last_contact',
+   'longitude',
+   'latitude',
+   'baro_altitude_m',
+   'on_ground',
+   'velocity_m_s',
+   'true_track', // Deg clockwise of N
+   'vertical_rate_m_s',
+   'sensors',
+   'geo_altitude_m',
+   'squawk',
+   'spi',
+   'position_source',
+];
+
+let g_flight_info_by_icao = new Object();
+
+async function on_refresh() {
+   if (!g_position) {
+      setTimeout(on_refresh, 3000);
+      return;
+   }
+
+   // Example query with bounding box covering Switzerland:
+   // https://opensky-network.org/api/states/all?lamin=45.8389&lomin=5.9962&lamax=47.8229&lomax=10.5226
+   const half_size = BOX_SIZE_DEG / 2;
+   const bbox = {
+      lomin: g_position.coords.longitude - half_size,
+      lomax: g_position.coords.longitude + half_size,
+      lamin: g_position.coords.latitude - half_size,
+      lamax: g_position.coords.latitude + half_size,
+   };
+
+   const query = encode_url_dict(bbox);
+   const url = 'https://opensky-network.org/api/states/all?' + query;
+   log(url)
+   const response = await fetch(url);
+   if (!response.ok) {
+      log('response.status:', response.status, response.statusText);
+      setTimeout(on_refresh, 3000);
+      return;
+   }
+   const j = await response.json();
+   g_flight_info_by_icao = {};
+   for (const x of j.states) {
+      const y = remap_keys(x, REMAP_OPENSKY_STATES);
+      log(y.icao);
+      g_flight_info_by_icao[y.icao] = y;
+   }
+   setTimeout(on_refresh, 3000);
+}
+on_refresh();
+
+// -
+
+function on_tick() {
+   setTimeout(on_tick, 3000);
+   let vals;
+
+   vals = [null];
+   if (g_orientation) {
+      vals = [g_orientation.alpha.toPrecision(4), g_orientation.beta.toPrecision(4),
+              g_orientation.gamma.toPrecision(4), g_orientation.absolute];
+   }
+   log.apply(null, ['g_orientation'].concat(vals))
+
+   vals = [null];
+   if (g_position) {
+      vals = [g_position.coords.latitude, g_position.coords.longitude];
+   }
+   log.apply(null, ['g_position'].concat(vals))
+}
+on_tick();
+
+// -
+
+// g_location_sprite: https://github.com/google/material-design-icons
+// g_plane_sprite: https://commons.wikimedia.org/wiki/File:Plane_icon_nose_up.svg
+function Sprite(src_elem, parent) {
+   const elem = src_elem.cloneNode();
+   elem.style.display = 'block';
+   //elem.style.position = 'absolute';
+
+   elem.style.width = '1vmin';
+   elem.style.height = '1vmin';
+   elem.style.marginLeft = '-0.5vmin';
+   elem.style.marginTop = '-0.5vmin';
+
+   if (parent) {
+      parent.appendChild(elem);
+   }
+
+   this.transform = (x) => {
+      elem.style.transform = x;
+   };
+   this.move = (pos, size, angle) => {
+      size = size || [1,1];
+      angle = angle || 0;
+
+      if (!(size instanceof Object)) {
+         size = [size, size];
+      }
+
+      const x = pos[0] * 100;
+      const y = pos[1] * 100;
+      const w = size[0];
+      const h = size[1];
+
+      this.transform(`translate(${x}vmin, ${y}vmin) scale(${w},${h}) rotate(${angle}deg)`);
+   };
+   this.elem = elem;
+}
+
+const here = new Sprite(g_location_sprite, g_top_down);
+here.move([0.5, 0.5], 6);
+
+const flight_sprite_by_icao = {};
+
+function on_raf() {
+   (() => {
+      if (!g_position)
+         return;
+
+      for (const k in flight_sprite_by_icao) {
+         const sprite = flight_sprite_by_icao[k];
+         if (k in g_flight_info_by_icao)
+            continue;
+         const e = flight_sprite_by_icao.elem;
+         e.parentNode.removeChild(e);
+         delete flight_sprite_by_icao[k];
+      }
+      const our_pos = g_position.coords;
+      log('our_pos', our_pos.latitude, our_pos.longitude);
+      let i = 0;
+      for (const icao in g_flight_info_by_icao) {
+         i += 1;
+         const info = g_flight_info_by_icao[icao];
+         log(icao, info.latitude, info.longitude);
+         //console.log(info);
+
+         if (!(icao in flight_sprite_by_icao)) {
+            flight_sprite_by_icao[info.icao] = new Sprite(g_plane_sprite, g_top_down);
+         }
+
+         const s = flight_sprite_by_icao[info.icao];
+         const pos = [
+            0.5 + (info.longitude - our_pos.longitude) / BOX_SIZE_DEG,
+            0.5 + -(info.latitude - our_pos.latitude) / BOX_SIZE_DEG,
+         ];
+         const size = 6;
+         const angle = info.true_track;
+         s.move(pos, size, angle);
+      }
+      log('flights: ', i);
+   })();
+   //requestAnimationFrame(on_raf);
+   setTimeout(on_raf, 1000);
+}
+on_raf();
+
+      </script>
+   </body>
+</html>

@@ -3,6 +3,8 @@
    <head>
       <meta charset='utf-8'>
       <title>Flight-AR</title>
+      <script src='https://cdnjs.cloudflare.com/ajax/libs/dat-gui/0.7.6/dat.gui.min.js'></script>
+      <script type='module' src='https://cdnjs.cloudflare.com/ajax/libs/three.js/106/three.module.js'></script>
    </head>
    <body>
       <style>
@@ -17,19 +19,17 @@ body {
    font-size: 1.5rem;
 }
 
-#g_location_sprite {
-   /* icon-ic_navigation_white_24dp */
-   background-image: url(sprite-alert-white.png);
-   background-position: -224px -0px;
-   width: 32px;
-   height: 32px;
-}
-
 #g_log {
    position: fixed;
    margin: 0em;
    padding-left: 0.5em;
    z-index: 1;
+   display: flex;
+   flex-direction: column;
+   max-height: 10vh;
+   width: 50vw;
+   overflow-x: hidden;
+   overflow-y: scroll;
 
    font-weight: bold;
    color: black;
@@ -39,85 +39,59 @@ body {
       0 0 2px white;
 }
 
-#g_top_down {
-   position: absolute;
-   z-index: -1;
-   margin-top: -50vmin;
-   top: 50%;
-   width: 100vmin;
-   height: 100vmin;
-   background-color: DarkGray;
+#g_canvas {
+   width: 100vw;
+   height: 100wh;
+   position: fixed;
 }
       </style>
 
       <pre id='g_log'></pre>
-      <div id='g_top_down'></div>
-      <img id='g_plane_sprite' src='200px-Plane_icon_nose_up.svg.png' style='display: none;'/>
-      <img id='g_location_sprite' src='ic_gps_fixed_white_48dp.png' style='display: none;'/>
-      <script>
-'use strict';
+      <canvas id='g_canvas'></div>
+      <script type='module'>
 
-const MIN_LOG_LINES = 3;
-const MAX_LOG_LINES = 30;
-
-g_log.lines = [];
-g_log.max_lines = MIN_LOG_LINES;
-
-function log() {
-   if (arguments.length) {
-      console.log.apply(null, arguments);
-      let args = [];
-      for (let x of arguments) {
-         if (x === undefined) {
-            x = 'undefined';
-         } else if (x === null) {
-            x = 'null';
-         } else if (typeof(x) !== 'string') {
-            x = x.toString();
-         }
-         args.push(x);
-      }
-      args = args.join(' ');
-      g_log.lines = g_log.lines.concat(args.split('\n'))
-   }
-
-   while (g_log.lines.length > MAX_LOG_LINES) {
-      g_log.lines.shift();
-   }
-   let lines = g_log.lines;
-   if (lines.length > g_log.max_lines) {
-      lines = lines.slice(lines.length - g_log.max_lines);
-   }
-   g_log.textContent = lines.join('\n');
+function log(...args) {
+   log_append(g_log, ...args);
 }
 
-function toggle_log_size(e) {
-   e.preventDefault(); // If touch, prevent mouse events.
-
-   if (g_log.max_lines == MAX_LOG_LINES) {
-      g_log.max_lines = MIN_LOG_LINES;
-   } else {
-      g_log.max_lines = MAX_LOG_LINES;
-   }
-   log(); // Redraw.
-}
-g_log.addEventListener('mousedown', toggle_log_size, true);
-g_log.addEventListener('touchstart', toggle_log_size, true);
+import * as THREE from 'https://cdnjs.cloudflare.com/ajax/libs/three.js/106/three.module.js';
+import * as OPENSKY from './opensky.js';
 
 log('Initializing...');
 
-// -
+// ------------------
 
-let g_orientation = null;
-let g_position = null;
+const UI = {
+   auto_orient: true,
+   elevation_m: 10,
+   flight_radius_km: 30,
+   //flight_radius_km: 10,
+   top_down: true,
+   spin_camera: false,
+};
 
+const GUI = new dat.GUI();
+GUI.add(UI, 'top_down').name('Top-down view');
+GUI.add(UI, 'auto_orient').name('Auto-orient');
+GUI.add(UI, 'elevation_m').name('Elevation offset (m)');
+GUI.add(UI, 'flight_radius_km').name('Flight radius (km)');
+GUI.add(UI, 'spin_camera');
+
+// ------------------
+
+let g_orientation = {
+   alpha: 0, // 360 - heading
+   beta: 90, // pitch
+   gamma: 0,
+   absolute: false,
+};
 function on_orientation(e) {
+   if (e.alpha === null)
+      return;
+
    g_orientation = e;
+   log(e);
    //log(e.alpha.toPrecision(4), e.beta.toPrecision(4), e.gamma.toPrecision(4), e.absolute);
-}
-function on_position(e) {
-   g_position = e;
-   //log(e.coords.latitude, e.coords.longitude);
 }
 
 // -
@@ -127,6 +101,20 @@ if ('onabsolutedeviceorientation' in window) {
 } else {
    log('No absolutedeviceorientation, falling back to deviceorientation.');
    window.addEventListener("deviceorientation", on_orientation);
+}
+
+// ------------------
+
+let g_position = {
+   coords: {
+      latitude: 37.6213129, // SFO
+      longitude: -122.3811441,
+   },
+};
+
+function on_position(e) {
+   g_position = e;
+   //log(e.coords.latitude, e.coords.longitude);
 }
 
 // -
@@ -142,93 +130,238 @@ const geo_options = {
 };
 navigator.geolocation.watchPosition(on_position, geo_error, geo_options);
 
+// ----------------
+
 // -
 
-const KM_PER_LAT = 111;
-const BOX_SIZE_KM = 60;
-const BOX_SIZE_DEG = BOX_SIZE_KM / KM_PER_LAT;
-
-function encode_url_dict(obj) {
-   let kvs = [];
-   for (const k in obj) {
-      const v = obj[k];
-      const kv = encodeURIComponent(k) + '=' + encodeURIComponent(v)
-      kvs.push(kv);
-   }
-   return kvs.join('&');
+function to_log_string(...args) {
+   args = args.map(x => {
+      if (typeof(x) !== 'string') {
+         x = '' + JSON.stringify(x);
+      }
+      return x;
+   });
+   return args.join(' ');
 }
 
-function remap_keys(obj, mapping) {
-   const ret = {};
-   for (const i in mapping) {
-      const k = mapping[i];
-      ret[k] = obj[i];
-   }
-   return ret;
+function log_append(container, ...args) {
+   const elem = document.createElement('div');
+   elem.textContent = to_log_string(...args);
+   log_append_elem(container, elem);
 }
 
-const REMAP_OPENSKY_STATES = [
-   'icao', // icao24
-   'callsign',
-   'origin_country',
-   'time_position',
-   'last_contact',
-   'longitude',
-   'latitude',
-   'baro_altitude_m',
-   'on_ground',
-   'velocity_m_s',
-   'true_track', // Deg clockwise of N
-   'vertical_rate_m_s',
-   'sensors',
-   'geo_altitude_m',
-   'squawk',
-   'spi',
-   'position_source',
+function log_append_elem(container, elem) {
+   let scroll_to = 0;
+   const style = getComputedStyle(container);
+   if (style.flexDirection == 'column') {
+      // Appends to bottom
+      const was = container.scrollTop;
+      container.scrollTop = 1e9;
+      if (container.scrollTop == was) {
+         scroll_to = 1e9;
+      } else {
+         container.scrollTop = was;
+      }
+   } else if (style.flexDirection == 'column-reverse') {
+      // Appends to top
+   } else {
+      console.log('Unexpected flexDirection: ' + style.flexDirection);
+   }
+
+   container.appendChild(elem);
+
+   const maxElems = container.maxLogElems || 300;
+   while (container.children.length > maxElems) {
+      container.removeChild(container.firstChild);
+   }
+
+   if (scroll_to) {
+      container.scrollTop = scroll_to;
+   }
+}
+
+// -
+
+const RENDERER = new THREE.WebGLRenderer({canvas: g_canvas});
+const UP = new THREE.Vector3( 0, 1, 0 );
+
+const fov = 50;
+const aspect = 1;  // the canvas default
+const near = 0.001;
+const far = 100; // in kms
+const CAMERA = new THREE.PerspectiveCamera(fov, aspect, near, far);
+CAMERA.position.set(0, 0, 0);
+CAMERA.lookAt(0, 0, 1);
+
+// -
+
+
+const PLANE_MESH = (() => {
+   const boxSize = 1;
+   let geom = new THREE.BoxGeometry(boxSize, boxSize, boxSize);
+   //const mat = new THREE.MeshBasicMaterial({color: 0x44aa88});  // greenish blue
+   //const mesh = new THREE.Mesh(geom, mat);
+   //add_wireframe(mesh);
+   geom = new THREE.WireframeGeometry( geom );
+   const lines = new THREE.LineSegments( geom );
+   //lines.material.depthTest = false;
+   //line.material.opacity = 0.25;
+   //lines.material.transparent = true;
+   //line.material.lineWidth = 1;
+   return lines;
+})();
+
+const SCENE = new THREE.Scene();
+//scene.add(PLANE_MESH);
+//PLANE_MESH.position.set(0.3, 1, 3);
+
+const EARTH_RADIUS = 6371.0;
+
+const GROUND = (() => {
+   let geom = new THREE.SphereGeometry(EARTH_RADIUS, 180, 360);
+   let mat = new THREE.MeshBasicMaterial( {color: 0x0033ff} );
+   mat.transparent = true;
+   mat.opacity = 1.0;
+   const mesh = new THREE.Mesh(geom, mat);
+   add_wireframe(mesh);
+   return mesh;
+})();
+
+SCENE.add(GROUND);
+
+// -
+
+function add_wireframe(mesh) {
+   const geom = new THREE.WireframeGeometry( mesh.geometry );
+   const line = new THREE.LineSegments( geom );
+   line.material.depthTest = false;
+   //line.material.opacity = 0.25;
+   line.material.transparent = true;
+   //line.material.lineWidth = 1;
+
+   mesh.add(line);
+   return line;
+}
+
+const geometry = new THREE.ConeGeometry( 5, 20, 32 );
+function cone_color_rotated(color, x, y, z, a) {
+   const material = new THREE.MeshBasicMaterial( {color: color} );
+   const cone = new THREE.Mesh( geometry, material );
+   SCENE.add( cone );
+   cone.quaternion.setFromAxisAngle(new THREE.Vector3(x, y, z), a);
+   return cone;
+}
+const CONES = [
+   cone_color_rotated(0xff0000, 0, 0, 1, -Math.PI/2),
+   cone_color_rotated(0x00ff00, 0, 1, 0, 0),
+   cone_color_rotated(0x0000ff, 1, 0, 0, Math.PI/2),
 ];
 
-let g_flight_info_by_icao = new Object();
-
-async function on_refresh() {
-   if (!g_position) {
-      setTimeout(on_refresh, 3000);
-      return;
-   }
-
-   // Example query with bounding box covering Switzerland:
-   // https://opensky-network.org/api/states/all?lamin=45.8389&lomin=5.9962&lamax=47.8229&lomax=10.5226
-   const half_size = BOX_SIZE_DEG / 2;
-   const bbox = {
-      lomin: g_position.coords.longitude - half_size,
-      lomax: g_position.coords.longitude + half_size,
-      lamin: g_position.coords.latitude - half_size,
-      lamax: g_position.coords.latitude + half_size,
-   };
-
-   const query = encode_url_dict(bbox);
-   const url = 'https://opensky-network.org/api/states/all?' + query;
-   log(url)
-   const response = await fetch(url);
-   if (!response.ok) {
-      log('response.status:', response.status, response.statusText);
-      setTimeout(on_refresh, 3000);
-      return;
-   }
-   const j = await response.json();
-   g_flight_info_by_icao = {};
-   for (const x of j.states) {
-      const y = remap_keys(x, REMAP_OPENSKY_STATES);
-      log(y.icao);
-      g_flight_info_by_icao[y.icao] = y;
-   }
-   setTimeout(on_refresh, 3000);
+function drop_cones(pos, quat) {
+   CONES.forEach(x => {
+      x = x.clone();
+      x.position.copy(pos);
+      x.quaternion.premultiply(quat);
+   });
 }
-on_refresh();
 
 // -
 
-function on_tick() {
-   setTimeout(on_tick, 3000);
+let g_planes = null;
+
+function unix_timestamp_s() {
+   return new Date() / 1000;
+}
+
+function make_quat(new_forward, new_up) {
+   const new_right = new_forward.clone().cross(new_up);
+   const new_rigid_up = new_right.clone().cross(new_forward);
+   const mat = new THREE.Matrix4().makeBasis(new_forward, new_rigid_up, new_right);
+   return new THREE.Quaternion().setFromRotationMatrix(mat);
+}
+
+class Plane {
+   constructor() {
+      this.mesh = PLANE_MESH.clone();
+      SCENE.add(this.mesh);
+
+      this.info = null;
+   }
+
+   new_info(info) {
+      this.info = info;
+
+      const sh_pos = latlon_to_spherical(info.latitude || 0, info.longitude || 0);
+      const altitude = info.geo_altitude_m || info.baro_altitude_m || 0;
+      sh_pos.radius += altitude / 1000;
+
+      const pos = new THREE.Vector3().setFromSpherical(sh_pos);
+      const north_pole = new THREE.Vector3(0, 1, 0);
+
+      const local_up = pos.clone().normalize();
+      const local_east = north_pole.clone().cross(local_up).normalize();
+      const local_north = local_up.clone().cross(local_east).normalize();
+
+      const track_ccw = -THREE.Math.degToRad(info.true_track || 0);
+      const track_vec = local_north.clone().applyAxisAngle(local_up, track_ccw);
+
+      const vel = track_vec.clone().multiplyScalar((info.velocity_m_s || 0) / 1000);
+      vel.addScaledVector(local_up, (info.vertical_rate_m_s || 0) / 1000);
+
+      this.pos = pos;
+      this.local_up = local_up;
+      this.local_east = local_east;
+      this.local_north = local_north;
+      this.track_vec = track_vec;
+      this.vel = vel;
+      this.dir = vel.clone().normalize();
+
+      const unix_timestamp = unix_timestamp_s();
+      const time_position = info.time_position || (unix_timestamp - 15);
+      this.time = performance.now() / 1000 + (-unix_timestamp + time_position);
+   }
+
+   update_pos(now) {
+      const interp = now - this.time;
+
+      const new_pos = this.pos.clone();
+      new_pos.addScaledVector(this.vel, interp);
+      this.mesh.position.copy(new_pos);
+
+      this.mesh.quaternion.copy(make_quat(this.dir, this.local_up));
+   }
+
+   remove() {
+      SCENE.remove(this.mesh);
+   }
+}
+
+function update_planes(new_flights) {
+   const update = {};
+
+   for (const x of new_flights) {
+      let plane = null;
+      if (g_planes && g_planes[x.icao]) {
+         plane = g_planes[x.icao];
+      } else {
+         plane = new Plane();
+      }
+      plane.new_info(x);
+      update[x.icao] = plane;
+   }
+
+   for (const k in g_planes) {
+      const plane = g_planes[k];
+      if (!update[k]) {
+         plane.remove();
+      }
+   }
+
+   g_planes = update;
+}
+
+async function on_tick() {
+   setTimeout(on_tick, 6000);
    let vals;
 
    vals = [null];
@@ -236,101 +369,82 @@ function on_tick() {
       vals = [g_orientation.alpha.toPrecision(4), g_orientation.beta.toPrecision(4),
               g_orientation.gamma.toPrecision(4), g_orientation.absolute];
    }
-   log.apply(null, ['g_orientation'].concat(vals))
+   log('g_orientation', vals);
 
    vals = [null];
    if (g_position) {
       vals = [g_position.coords.latitude, g_position.coords.longitude];
+
+      const flights = await OPENSKY.fetchAround(g_position, UI.flight_radius_km);
+      if (flights) {
+         update_planes(flights);
+      }
    }
-   log.apply(null, ['g_position'].concat(vals))
+   log('g_position', vals);
 }
 on_tick();
 
 // -
 
-// g_location_sprite: https://github.com/google/material-design-icons
-// g_plane_sprite: https://commons.wikimedia.org/wiki/File:Plane_icon_nose_up.svg
-function Sprite(src_elem, parent) {
-   const elem = src_elem.cloneNode();
-   elem.style.display = 'block';
-   //elem.style.position = 'absolute';
-
-   elem.style.width = '1vmin';
-   elem.style.height = '1vmin';
-   elem.style.marginLeft = '-0.5vmin';
-   elem.style.marginTop = '-0.5vmin';
-
-   if (parent) {
-      parent.appendChild(elem);
-   }
-
-   this.transform = (x) => {
-      elem.style.transform = x;
-   };
-   this.move = (pos, size, angle) => {
-      size = size || [1,1];
-      angle = angle || 0;
-
-      if (!(size instanceof Object)) {
-         size = [size, size];
-      }
-
-      const x = pos[0] * 100;
-      const y = pos[1] * 100;
-      const w = size[0];
-      const h = size[1];
-
-      this.transform(`translate(${x}vmin, ${y}vmin) scale(${w},${h}) rotate(${angle}deg)`);
-   };
-   this.elem = elem;
+function latlon_to_spherical(latitude, longitude) {
+   return new THREE.Spherical(EARTH_RADIUS,
+                              THREE.Math.degToRad(90 - latitude),
+                              THREE.Math.degToRad(longitude));
 }
 
-const here = new Sprite(g_location_sprite, g_top_down);
-here.move([0.5, 0.5], 6);
+function on_frame() {
+   const now = performance.now() / 1000;
+   requestAnimationFrame(on_frame);
 
-const flight_sprite_by_icao = {};
+   RENDERER.setPixelRatio( window.devicePixelRatio );
+   RENDERER.setSize( window.innerWidth, window.innerHeight );
+   CAMERA.aspect = window.innerWidth / window.innerHeight;
+   CAMERA.aspect = (CAMERA.aspect + 1) / 2.0;
+   CAMERA.updateProjectionMatrix();
 
-function on_raf() {
+   const angle = new THREE.Euler(THREE.Math.degToRad(g_orientation.beta),
+                                 THREE.Math.degToRad(g_orientation.gamma),
+                                 THREE.Math.degToRad(g_orientation.alpha), 'ZXY');
+
    (() => {
       if (!g_position)
          return;
 
-      for (const k in flight_sprite_by_icao) {
-         const sprite = flight_sprite_by_icao[k];
-         if (k in g_flight_info_by_icao)
-            continue;
-         const e = flight_sprite_by_icao.elem;
-         e.parentNode.removeChild(e);
-         delete flight_sprite_by_icao[k];
-      }
-      const our_pos = g_position.coords;
-      log('our_pos', our_pos.latitude, our_pos.longitude);
-      let i = 0;
-      for (const icao in g_flight_info_by_icao) {
-         i += 1;
-         const info = g_flight_info_by_icao[icao];
-         log(icao, info.latitude, info.longitude);
-         //console.log(info);
+      const coords = g_position.coords;
+      const sh_origin = latlon_to_spherical(coords.latitude, coords.longitude);
+      sh_origin.radius += UI.elevation_m / 1000;
 
-         if (!(icao in flight_sprite_by_icao)) {
-            flight_sprite_by_icao[info.icao] = new Sprite(g_plane_sprite, g_top_down);
-         }
+      const origin = new THREE.Vector3().setFromSpherical(sh_origin);
+      const up = origin.clone().normalize();
+      const local_north = new THREE.Vector3(0, 1, 0).projectOnPlane(up);
 
-         const s = flight_sprite_by_icao[info.icao];
-         const pos = [
-            0.5 + (info.longitude - our_pos.longitude) / BOX_SIZE_DEG,
-            0.5 + -(info.latitude - our_pos.latitude) / BOX_SIZE_DEG,
-         ];
-         const size = 6;
-         const angle = info.true_track;
-         s.move(pos, size, angle);
+      CAMERA.position.copy(origin);
+
+      let look_at = origin.clone();
+      if (UI.top_down) {
+         CAMERA.position.addScaledVector(up, 20);
+         CAMERA.up.copy(local_north);
       }
-      log('flights: ', i);
+      CAMERA.lookAt(look_at);
+
+      //if (performance.now() % 3000 == 0) {
+      //   drop_cones(origin, new THREE.Quaternion());
+      //}
+
+      if (!g_planes)
+         return;
+
+      //console.log(g_planes);
+      for (const [icao, plane] of Object.entries(g_planes)) {
+         plane.update_pos(now);
+      }
    })();
-   //requestAnimationFrame(on_raf);
-   setTimeout(on_raf, 1000);
+   if (UI.spin_camera) {
+      CAMERA.rotation.y = performance.now() / 1000 * (Math.PI * 2) / 10; // 1/10Hz spin
+   }
+   RENDERER.render(SCENE, CAMERA);
 }
-on_raf();
+on_frame();
 
       </script>
    </body>
