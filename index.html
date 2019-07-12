@@ -170,7 +170,7 @@ function log_append_elem(container, elem) {
 
    container.appendChild(elem);
 
-   const maxElems = container.maxLogElems || 300;
+   const maxElems = container.maxLogElems || 30;
    while (container.children.length > maxElems) {
       container.removeChild(container.firstChild);
    }
@@ -197,7 +197,7 @@ CAMERA.lookAt(0, 0, 1);
 
 
 const PLANE_MESH = (() => {
-   const boxSize = 1;
+   const boxSize = 0.3;
    let geom = new THREE.BoxGeometry(boxSize, boxSize, boxSize);
    //const mat = new THREE.MeshBasicMaterial({color: 0x44aa88});  // greenish blue
    //const mesh = new THREE.Mesh(geom, mat);
@@ -392,19 +392,19 @@ function latlon_to_spherical(latitude, longitude) {
                               THREE.Math.degToRad(longitude));
 }
 
+let frame_id = -1;
 function on_frame() {
    const now = performance.now() / 1000;
    requestAnimationFrame(on_frame);
+   frame_id += 1;
+   //if (frame_id % 6 != 0)
+   //   return;
 
    RENDERER.setPixelRatio( window.devicePixelRatio );
    RENDERER.setSize( window.innerWidth, window.innerHeight );
    CAMERA.aspect = window.innerWidth / window.innerHeight;
    CAMERA.aspect = (CAMERA.aspect + 1) / 2.0;
    CAMERA.updateProjectionMatrix();
-
-   const angle = new THREE.Euler(THREE.Math.degToRad(g_orientation.beta),
-                                 THREE.Math.degToRad(g_orientation.gamma),
-                                 THREE.Math.degToRad(g_orientation.alpha), 'ZXY');
 
    (() => {
       if (!g_position)
@@ -416,16 +416,35 @@ function on_frame() {
 
       const origin = new THREE.Vector3().setFromSpherical(sh_origin);
       const up = origin.clone().normalize();
-      const local_north = new THREE.Vector3(0, 1, 0).projectOnPlane(up);
+      const local_north = new THREE.Vector3(0, 1, 0).projectOnPlane(up).normalize();
 
       CAMERA.position.copy(origin);
 
-      let look_at = origin.clone();
+      const down = up.clone().negate();
+      const device_to_world = make_quat(down, local_north);
+      const world_to_screen = make_quat(new THREE.Vector3(0, 0,-1), new THREE.Vector3(0, 1, 0)).conjugate();
+      //CAMERA.quaternion.multiplyQuaternions(device_to_world, world_to_screen);
+      //CAMERA.quaternion.set(1).multiply(device_to_world).multiply(world_to_screen);
+
+      const look_at = origin.clone();
+      CAMERA.up.copy(local_north);
+      CAMERA.lookAt(look_at.add(down));
       if (UI.top_down) {
          CAMERA.position.addScaledVector(up, 20);
-         CAMERA.up.copy(local_north);
+         //CAMERA.up.copy(local_north);
+         //CAMERA.lookAt(look_at);
+      } else {
+         //CAMERA.position.addScaledVector(up, 20);
+         const alpha = g_orientation.alpha + 0 * ((performance.now() / 1000) % 1.0);
+         const beta = g_orientation.beta + 0 * ((performance.now() / 3000) % 1.0);
+         const gamma = g_orientation.gamma + 0 * ((performance.now() / 1000) % 1.0);
+         let camera_offset = new THREE.Euler(THREE.Math.degToRad(beta),
+                                             THREE.Math.degToRad(gamma),
+                                             THREE.Math.degToRad(alpha), 'ZXY');
+         //console.log('camera_offset', camera_offset);
+         camera_offset = new THREE.Quaternion().setFromEuler(camera_offset);
+         CAMERA.quaternion.multiply(camera_offset);
       }
-      CAMERA.lookAt(look_at);
 
       //if (performance.now() % 3000 == 0) {
       //   drop_cones(origin, new THREE.Quaternion());
